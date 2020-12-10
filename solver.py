@@ -87,7 +87,7 @@ class Solver(object):
             self.Encoder.load_state_dict(ckpt['Encoder'])
             for k, v in self.Encoder.named_parameters():
                 v.requires_grad = False
-            print('Successfully load Encoder model form {}.'.format(self.reuse_encoder_dir))
+            print('Successfully load Encoder model from {}.'.format(self.reuse_encoder_dir))
 
     def generator(self, x, target_c, origin_c=None):
         feature = self.Encoder(x)
