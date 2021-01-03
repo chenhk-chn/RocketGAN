@@ -10,6 +10,7 @@ from torchvision.utils import save_image
 
 from model import *
 from sampler import sampler
+import tqdm
 
 
 class Solver(object):
@@ -32,6 +33,10 @@ class Solver(object):
 
         # Training configurations.
         self.c_dim = len(self.expanding_cam)  # how many camera does target set have.
+        if self.source_dataset == 'duke':
+            self.source_c_dim = 8
+        else:
+            self.source_c_dim = 6
         self.batch_size = config.batch_size
         self.num_iters = config.num_iters
         self.num_iters_decay = config.num_iters_decay
@@ -61,12 +66,8 @@ class Solver(object):
 
         # Build the model.
         self.Encoder = Encoder(config.g_conv_dim, config.g_repeat_num)  # 2 for mask vector.
-        if self.reuse_encoder:
-            self.Decoder = Decoder(c_dim=self.c_dim)
-            self.D = Discriminator(self.c_dim)
-        else:
-            self.Decoder = Decoder(c_dim=self.c_dim + 1)
-            self.D = Discriminator(self.c_dim + 1)
+        self.Decoder = Decoder(c_dim=self.source_c_dim + self.c_dim + 2)
+        self.D = Discriminator(c_dim=self.source_c_dim+self.c_dim)
 
         self.print_network(self.Encoder, 'Encoder')
         self.print_network(self.Decoder, 'Decoder')
@@ -125,26 +126,19 @@ class Solver(object):
         for param_group in self.d_optimizer.param_groups:
             param_group['lr'] = d_lr
 
-    def grad_penalty(self, net, x, coeff=10):
-        """Calculate R1 regularization gradient penalty"""
-        x.requires_grad = True
-        real_predict, _ = net(x)
-        gradients = grad(outputs=real_predict.mean(), inputs=x, create_graph=True)[0]
-        gradients = gradients.view(gradients.size(0), -1)
-        gradient_penalty = (coeff / 2) * ((gradients.norm(2, dim=1) ** 2).mean())
-        return gradient_penalty
+    def gradient_penalty(self, y, x):
+        """Compute gradient penalty: (L2_norm(dy/dx) - 1)**2."""
+        weight = torch.ones(y.size()).to(self.device)
+        dydx = torch.autograd.grad(outputs=y, inputs=x, grad_outputs=weight, retain_graph=True, create_graph=True,
+                                   only_inputs=True)[0]
+        dydx = dydx.view(dydx.size(0), -1)
+        dydx_l2norm = torch.sqrt(torch.sum(dydx ** 2, dim=1))
+        return torch.mean((dydx_l2norm - 1) ** 2)
 
-    def adv_loss(self, x, real=True):
-        target = torch.ones(x.size()).type_as(x) if real else torch.zeros(x.size()).type_as(x)
-        return nn.MSELoss(reduction='none')(x, target)
-
-    def label2onehot(self, labels):
+    def label2onehot(self, labels, dim):
         """Convert label indices to one-hot vectors."""
         batch_size = labels.size(0)
-        if self.reuse_encoder:
-            out = torch.zeros(batch_size, self.c_dim)
-        else:
-            out = torch.zeros(batch_size, self.c_dim + 1)
+        out = torch.zeros(batch_size, dim)
         out[np.arange(batch_size), labels.long()] = 1
         return out
 
@@ -175,20 +169,19 @@ class Solver(object):
         return img.clamp_(0, 1)
 
     def train(self):
-        """Train StarGAN with multiple datasets."""
-        # Data iterators.
+        """Train StarGAN cross multi dataset."""
+        # Fetch fixed inputs for debugging.
         source_iter = iter(self.source_loader)
         target_iter = iter(self.target_loader)
-
-        # Fetch fixed inputs for debugging.
-        x_fixed, c_org, _, _ = next(source_iter)  # c for camera num; label for one-hot vector
+        x_fixed, c_org, _, _ = next(source_iter)
         x_fixed = x_fixed.to(self.device)
-        label_fixed_list = []
+
+        c_target_list = []
         for i in range(self.c_dim):
-            c_trg = torch.ones(x_fixed.size(0)).type_as(c_org) * i
-            label_trg = self.label2onehot(c_trg)
-            label_trg = label_trg.to(self.device)
-            label_fixed_list.append(label_trg)
+            c_trg = self.label2onehot(torch.ones(x_fixed.size(0)) * i, self.c_dim)
+            c_target_list.append(c_trg.to(self.device))
+        mask_target = self.label2onehot(torch.ones(x_fixed.size(0)), 2).to(self.device)  # Mask vector: [0, 1].
+        zero_source = torch.zeros(x_fixed.size(0), self.source_c_dim).to(self.device)  # Zero vector for Source dataset.
 
         # Learning rate cache for decaying.
         g_lr = self.g_lr
@@ -198,15 +191,14 @@ class Solver(object):
         print('Start training...')
         start_time = time.time()
         for i in range(self.num_iters):
-            cyclemod = ['target'] if self.reuse_encoder else ['source', 'target']
-            for dataset in cyclemod:
+            for dataset in ['source', 'target']:
+
                 # =================================================================================== #
                 #                             1. Preprocess input data                                #
                 # =================================================================================== #
-
-                # Fetch real images and labels.
                 data_iter = source_iter if dataset == 'source' else target_iter
 
+                # Fetch real images and labels.
                 try:
                     x_real, c_org, _, _ = next(data_iter)
                 except:
@@ -216,18 +208,29 @@ class Solver(object):
                     elif dataset == 'target':
                         target_iter = iter(self.target_loader)
                         x_real, c_org, _, _ = next(target_iter)
-                if dataset == 'source':
-                    c_org = torch.ones(c_org.size()).type_as(c_org) * self.c_dim
 
                 # Generate target domain labels randomly.
                 rand_idx = torch.randperm(c_org.size(0))
                 c_trg = c_org[rand_idx]
 
+                if dataset == 'source':
+                    label_org = self.label2onehot(c_org, self.source_c_dim)
+                    label_trg = self.label2onehot(c_trg, self.source_c_dim)
+                    zero = torch.zeros(x_real.size(0), self.c_dim)
+                    mask = self.label2onehot(torch.zeros(x_real.size(0)), 2)
+                    label_org = torch.cat([label_org, zero, mask], dim=1)
+                    label_trg = torch.cat([label_trg, zero, mask], dim=1)
+                elif dataset == 'target':
+                    label_org = self.label2onehot(c_org, self.c_dim)
+                    label_trg = self.label2onehot(c_trg, self.c_dim)
+                    zero = torch.zeros(x_real.size(0), self.source_c_dim)
+                    mask = self.label2onehot(torch.ones(x_real.size(0)), 2)
+                    label_org = torch.cat([zero, label_org, mask], dim=1)
+                    label_trg = torch.cat([zero, label_trg, mask], dim=1)
+
                 x_real = x_real.to(self.device)  # Input images.
                 c_org = c_org.to(self.device)  # Original domain labels.
                 c_trg = c_trg.to(self.device)  # Target domain labels.
-                label_org = self.label2onehot(c_org)
-                label_trg = self.label2onehot(c_trg)
                 label_org = label_org.to(self.device)  # Labels for computing classification loss.
                 label_trg = label_trg.to(self.device)  # Labels for computing classification loss.
 
@@ -236,24 +239,31 @@ class Solver(object):
                 # =================================================================================== #
 
                 # Compute loss with real images.
-                out_real, out_cls = self.D(x_real)
+                out_src, out_cls = self.D(x_real)
+                d_loss_real = - torch.mean(out_src)
+                out_cls = out_cls[:, :self.source_c_dim] if dataset == 'source' else out_cls[:, self.source_c_dim:]
                 d_loss_cls = self.classification_loss(out_cls, c_org)
 
                 # Compute loss with fake images.
                 x_fake = self.generator(x_real, label_trg)
-                out_fake, _ = self.D(x_fake.detach())
-                d_loss_adv = self.adv_loss(out_real, True).mean() + self.adv_loss(out_fake, False).mean()
+                out_src, _ = self.D(x_fake.detach())
+                d_loss_fake = torch.mean(out_src)
 
                 # Compute loss for gradient penalty.
-                d_loss_gp = self.grad_penalty(self.D, x_real)
+                alpha = torch.rand(x_real.size(0), 1, 1, 1).to(self.device)
+                x_hat = (alpha * x_real.data + (1 - alpha) * x_fake.data).requires_grad_(True)
+                out_src, _ = self.D(x_hat)
+                d_loss_gp = self.gradient_penalty(out_src, x_hat)
 
                 # Backward and optimize.
-                d_loss = d_loss_adv + self.lambda_gp * d_loss_gp + self.lambda_cls * d_loss_cls
-                self.opt_d_loss(d_loss)
+                d_loss = d_loss_real + d_loss_fake + self.lambda_gp * d_loss_gp + self.lambda_cls * d_loss_cls
 
                 # Logging.
-                d_loss_dic = {'D/loss_adv': d_loss_adv.item(), 'D/loss_gp': d_loss_gp.item(),
+                d_loss_log = {'D/loss_real': d_loss_real.item(), 'D/loss_fake': d_loss_fake.item(),
+                              'D/loss_adv': d_loss_real.item() + d_loss_fake.item(), 'D/loss_gp': d_loss_gp.item(),
                               'D/loss_cls': d_loss_cls.item()}
+
+                self.opt_d_loss(d_loss)
 
                 # =================================================================================== #
                 #                               3. Train the generator                                #
@@ -262,44 +272,50 @@ class Solver(object):
                 if (i + 1) % self.n_critic == 0:
                     # Original-to-target domain.
                     x_fake, x_reconst = self.generator(x_real, label_trg, label_org)
-                    out_fake, out_cls = self.D(x_fake)
-                    g_loss_adv = self.adv_loss(out_fake, True).mean()
+                    out_src, out_cls = self.D(x_fake)
+                    g_loss_fake = - torch.mean(out_src)
+                    out_cls = out_cls[:, :self.source_c_dim] if dataset == 'source' else out_cls[:, self.source_c_dim:]
                     g_loss_cls = self.classification_loss(out_cls, c_trg)
+
+                    # Target-to-original domain.
                     g_loss_rec = torch.mean(torch.abs(x_real - x_reconst))
 
-                    # Backward and optimize.
-                    g_loss = g_loss_adv + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_cls
-                    self.opt_g_loss(g_loss)
-
                     # Logging.
-                    g_loss_dic = {'G/loss_adv': g_loss_adv.item(), 'G/loss_rec': g_loss_rec.item(),
+                    g_loss_log = {'G/loss_fake': g_loss_fake.item(), 'G/loss_rec': g_loss_rec.item(),
                                   'G/loss_cls': g_loss_cls.item()}
+
+                    # Backward and optimize.
+                    g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_cls
+
+                    self.opt_g_loss(g_loss)
 
             # =================================================================================== #
             #                                 4. Miscellaneous                                    #
             # =================================================================================== #
 
-            # Print out training info.
+            # Print out training information and translate fixed images for debugging.
             if (i + 1) % self.log_step == 0:
                 print('\n')
                 et = time.time() - start_time
                 et = str(datetime.timedelta(seconds=et))[:-7]
                 log = "Elapsed [{}], Iteration [{}/{}]\n".format(et, i + 1, self.num_iters)
-                for tag, value in d_loss_dic.items():
-                    log += "{}:{:.4f}   ".format(tag, value)
-                log += '\n'
-                for tag, value in g_loss_dic.items():
-                    log += "{}: {:.4f}   ".format(tag, value)
+                log += 'D loss: '
+                for tag, value in d_loss_log.items():
+                    log += "{}: {:.4f}  ".format(tag, value)
+                log += '\nG Loss: '
+                for tag, value in g_loss_log.items():
+                    log += "{}: {:.4f}  ".format(tag, value)
                 print(log)
 
                 with torch.no_grad():
                     x_fake_list = [x_fixed]
-                    for label_fixed in label_fixed_list:
-                        x_fake_list.append(self.generator(x_fixed, label_fixed))
+                    for c_fixed in c_target_list:
+                        c_trg = torch.cat([zero_source, c_fixed, mask_target], dim=1)
+                        x_fake_list.append(self.generator(x_fixed, c_trg))
                     x_concat = torch.cat(x_fake_list, dim=3)
                     sample_path = os.path.join(self.sample_dir, '{}-images.jpg'.format(i + 1))
-                    save_image(x_concat.data.cpu(), sample_path, nrow=1, padding=0, range=(-1, 1), normalize=True)
-                    print('Saved real and fake images into {}...'.format(sample_path))
+                    save_image(self.denorm(x_concat.data.cpu()), sample_path, nrow=1, padding=0)
+                    print('Saved real and fake images into {}...\n'.format(sample_path))
 
             # Save model checkpoints.
             if (i + 1) % self.model_save_step == 0:
@@ -313,38 +329,50 @@ class Solver(object):
                 print('Saved model checkpoints into {}...'.format(self.model_save_dir))
 
             # Decay learning rates.
-            if (i + 1) % self.lr_update_step == 0 and (i + 1) > (self.num_iters - self.num_iters_decay):
+            if (i + 1) > (self.num_iters - self.num_iters_decay):
                 g_lr -= (self.g_lr / float(self.num_iters_decay))
                 d_lr -= (self.d_lr / float(self.num_iters_decay))
                 self.update_lr(g_lr, d_lr)
-                print('Decayed learning rates, g_lr: {}, d_lr: {}.'.format(g_lr, d_lr))
+                if (i + 1) % self.log_step == 0:
+                    print('Decayed learning rates, g_lr: {}, d_lr: {}.'.format(g_lr, d_lr))
 
     def test(self):
-        """Translate images using StarGAN trained on multiple datasets."""
-        # Load the trained generator.
-        with tqdm.tqdm(total=len(self.test_loader)) as pbar:
-            with torch.no_grad():
-                for i, (x_real, c_org, name, _) in enumerate(self.test_loader):
-                    x_real = x_real.to(self.device)
+        """Translate images using StarGAN trained on a single dataset."""
+        # Set data loader.
+        data_loader = self.test_loader
+        pbar = tqdm.tqdm(range(len(data_loader)))
 
-                    # Translate images.
-                    c_fixed_num = self.c_dim
-                    x_fake_list = [x_real]
-                    for jj in range(c_fixed_num):
-                        label_trg = self.label2onehot(torch.ones(c_org.size()).type_as(c_org) * jj)
-                        label_trg = label_trg.to(self.device)
-                        x_fake_list.append(self.generator(x_real, label_trg))
+        with torch.no_grad():
+            for i, (x_real, c_org, name, _) in enumerate(data_loader):
+                # Prepare input images and target domain labels.
+                x_real = x_real.to(self.device)
 
-                    for jj in range(len(x_fake_list)):
-                        image_list = x_fake_list[jj]
-                        for kk in range(len(name)):
-                            if jj == 0:
-                                continue
-                            else:
-                                save_name = name[kk][:-4] + '_fake_s2t_' + str(self.expanding_cam[jj - 1]) + '.jpg'
-                            save_path = os.path.join(self.result_dir, save_name)
-                            save_image(image_list[kk].data, save_path, nrow=1, padding=0, range=(-1, 1), normalize=True)
-                    pbar.update(1)
+                c_target_list = []
+                for ii in range(self.c_dim):
+                    c_trg = self.label2onehot(torch.ones(x_real.size(0)) * ii, self.c_dim)
+                    c_target_list.append(c_trg.to(self.device))
+                mask_target = self.label2onehot(torch.ones(x_real.size(0)), 2).to(self.device)  # Mask vector: [0, 1].
+                zero_source = torch.zeros(x_real.size(0), self.source_c_dim).to(self.device)  # Zero vector for Source.
+
+                # Translate images.
+                x_fake_list = [x_real]
+                for c_target in c_target_list:
+                    c_trg = torch.cat([zero_source, c_target, mask_target], dim=1)
+                    x_fake_list.append(self.generator(x_real, c_trg))
+
+                for jj in range(len(x_fake_list)):
+                    image_list = x_fake_list[jj]
+                    for kk in range(len(name)):
+                        if jj == 0:
+                            continue
+                        else:
+                            # save_name = name_real[kk][:-4] + '_fake_' + str(c_org[kk] + 1) + 'to' + str(jj) + '.jpg'
+                            save_name = name[kk][:-4] + '_s2t_' + str(self.expanding_cam[jj - 1]) + '.jpg'
+                        save_path = os.path.join(self.result_dir, save_name)
+                        save_image(self.denorm(image_list[kk].data), save_path, nrow=1, padding=0)
+                state_msg = '[{}/{}]:Test images saved into {}.'.format(i + 1, len(data_loader), self.result_dir)
+                pbar.set_description(state_msg)
+                pbar.update(1)
 
     def sample(self):
         self.sampler.sample()

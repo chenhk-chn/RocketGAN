@@ -61,6 +61,8 @@ def main(config):
     random.seed(config.seed)
 
     # Init training parameter.
+    if config.reuse_encoder_dir is not None:
+        config.num_iters = config.num_iters // 2
     config.num_iters_decay = config.num_iters // 2
     config.test_iters = config.num_iters
     config.model_save_step = config.num_iters // 6
@@ -125,7 +127,7 @@ if __name__ == '__main__':
     parser.add_argument('--d_repeat_num', type=int, default=6, help='number of strided conv layers in D')
     parser.add_argument('--lambda_cls', type=float, default=1, help='weight for domain classification loss')
     parser.add_argument('--lambda_rec', type=float, default=10, help='weight for reconstruction loss')
-    parser.add_argument('--lambda_gp', type=float, default=1, help='weight for gradient penalty')
+    parser.add_argument('--lambda_gp', type=float, default=10, help='weight for gradient penalty')
 
     # Training configuration.
     parser.add_argument('--source_dataset', type=str, default='market', choices=['market', 'duke'])
@@ -134,7 +136,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_iters', type=int, default=120000, help='number of total iterations for training D')
     parser.add_argument('--g_lr', type=float, default=0.0001, help='learning rate for G')
     parser.add_argument('--d_lr', type=float, default=0.0001, help='learning rate for D')
-    parser.add_argument('--n_critic', type=int, default=1, help='number of D updates per each G update')
+    parser.add_argument('--n_critic', type=float, default=5, help='number of D updates per each G update')
 
     # Miscellaneous.
     parser.add_argument('--num_workers', type=int, default=4)
