@@ -2,15 +2,12 @@ import datetime
 import os
 import time
 
-import numpy as np
 import torch.nn.functional as F
 import tqdm
-from torch.autograd import grad
 from torchvision.utils import save_image
 
 from model import *
 from sampler import sampler
-import tqdm
 
 
 class Solver(object):
@@ -33,10 +30,7 @@ class Solver(object):
 
         # Training configurations.
         self.c_dim = len(self.expanding_cam)  # how many camera does target set have.
-        if self.source_dataset == 'duke':
-            self.source_c_dim = 8
-        else:
-            self.source_c_dim = 6
+        self.source_c_dim = 1
         self.batch_size = config.batch_size
         self.num_iters = config.num_iters
         self.num_iters_decay = config.num_iters_decay
@@ -67,7 +61,7 @@ class Solver(object):
         # Build the model.
         self.Encoder = Encoder(config.g_conv_dim, config.g_repeat_num)  # 2 for mask vector.
         self.Decoder = Decoder(c_dim=self.source_c_dim + self.c_dim + 2)
-        self.D = Discriminator(c_dim=self.source_c_dim+self.c_dim)
+        self.D = Discriminator(c_dim=self.c_dim)
 
         self.print_network(self.Encoder, 'Encoder')
         self.print_network(self.Decoder, 'Decoder')
@@ -208,6 +202,8 @@ class Solver(object):
                     elif dataset == 'target':
                         target_iter = iter(self.target_loader)
                         x_real, c_org, _, _ = next(target_iter)
+                if dataset == 'source':
+                    c_org = torch.zeros(c_org.size(0)).type_as(c_org)
 
                 # Generate target domain labels randomly.
                 rand_idx = torch.randperm(c_org.size(0))
@@ -241,8 +237,8 @@ class Solver(object):
                 # Compute loss with real images.
                 out_src, out_cls = self.D(x_real)
                 d_loss_real = - torch.mean(out_src)
-                out_cls = out_cls[:, :self.source_c_dim] if dataset == 'source' else out_cls[:, self.source_c_dim:]
-                d_loss_cls = self.classification_loss(out_cls, c_org)
+                if dataset == 'target':
+                    d_loss_cls = self.classification_loss(out_cls, c_org)
 
                 # Compute loss with fake images.
                 x_fake = self.generator(x_real, label_trg)
@@ -255,13 +251,15 @@ class Solver(object):
                 out_src, _ = self.D(x_hat)
                 d_loss_gp = self.gradient_penalty(out_src, x_hat)
 
-                # Backward and optimize.
-                d_loss = d_loss_real + d_loss_fake + self.lambda_gp * d_loss_gp + self.lambda_cls * d_loss_cls
-
                 # Logging.
                 d_loss_log = {'D/loss_real': d_loss_real.item(), 'D/loss_fake': d_loss_fake.item(),
-                              'D/loss_adv': d_loss_real.item() + d_loss_fake.item(), 'D/loss_gp': d_loss_gp.item(),
-                              'D/loss_cls': d_loss_cls.item()}
+                              'D/loss_adv': d_loss_real.item() + d_loss_fake.item(), 'D/loss_gp': d_loss_gp.item()}
+
+                # Backward and optimize.
+                d_loss = d_loss_real + d_loss_fake + self.lambda_gp * d_loss_gp
+                if dataset == 'target':
+                    d_loss += self.lambda_cls * d_loss_cls
+                    d_loss_log['D/loss_cls'] = d_loss_cls.item()
 
                 self.opt_d_loss(d_loss)
 
@@ -274,18 +272,20 @@ class Solver(object):
                     x_fake, x_reconst = self.generator(x_real, label_trg, label_org)
                     out_src, out_cls = self.D(x_fake)
                     g_loss_fake = - torch.mean(out_src)
-                    out_cls = out_cls[:, :self.source_c_dim] if dataset == 'source' else out_cls[:, self.source_c_dim:]
-                    g_loss_cls = self.classification_loss(out_cls, c_trg)
+                    if dataset == 'target':
+                        g_loss_cls = self.classification_loss(out_cls, c_trg)
 
                     # Target-to-original domain.
                     g_loss_rec = torch.mean(torch.abs(x_real - x_reconst))
 
                     # Logging.
-                    g_loss_log = {'G/loss_fake': g_loss_fake.item(), 'G/loss_rec': g_loss_rec.item(),
-                                  'G/loss_cls': g_loss_cls.item()}
+                    g_loss_log = {'G/loss_fake': g_loss_fake.item(), 'G/loss_rec': g_loss_rec.item()}
 
                     # Backward and optimize.
-                    g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_cls
+                    g_loss = g_loss_fake + self.lambda_rec * g_loss_rec
+                    if dataset == 'target':
+                        g_loss += self.lambda_cls * g_loss_cls
+                        g_loss_log['G/loss_cls'] = g_loss_cls.item()
 
                     self.opt_g_loss(g_loss)
 
